@@ -56,7 +56,7 @@ with st.sidebar:
                                 help="Create one at build.nvidia.com → API keys. Only kept in this browser session.")
         options, tested = [], {}
         if api_key:
-            with st.spinner("Testing which NVIDIA models your key can use …"):
+            with st.spinner("Testing which NVIDIA models your key can use (up to 90 s) …"):
                 options, tested = nvidia_models(api_key)
         if options:
             model = st.selectbox("Model", options, index=0,
@@ -67,8 +67,10 @@ with st.sidebar:
                 if any(r == "HTTP 401" for r in tested.values()):
                     st.error("NVIDIA rejected the key (401). Create a new one at build.nvidia.com → API keys.")
                 else:
-                    st.warning("None of the tested models answered. Copy a model ID from build.nvidia.com/models "
-                               "(page 'Try API') and paste it below.")
+                    slow = [m for m, r in tested.items() if r == "timeout"]
+                    st.warning("No model answered within 90 s. NVIDIA's free models are sometimes busy – "
+                               "try again in a few minutes" + (f", or type one of the slow ones below, e.g. `{slow[0]}`."
+                                                               if slow else "."))
             model = st.text_input("Model", value=llm.NVIDIA_DEFAULT_MODEL,
                                   help="Any chat model ID from build.nvidia.com/models")
         if tested:

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pandas as pd
 
 from screener import llm
+from screener.classify import Rating
 from screener.pipeline import company_summary, screen_report
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -102,7 +103,7 @@ def test_nvidia_model_list_prefers_recommended(monkeypatch):
         def __exit__(self, *a): return False
 
     monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: Resp())
-    assert llm.nvidia_chat_models("k") == ["meta/llama-3.3-70b-instruct", "deepseek-ai/deepseek-v4-flash",
+    assert llm.nvidia_chat_models("k") == ["deepseek-ai/deepseek-v4-flash", "meta/llama-3.3-70b-instruct",
                                            "zeta/some-chat-model"]
 
 
@@ -115,17 +116,25 @@ def test_company_from_filename():
 
 
 def test_nvidia_working_models_skips_unavailable(monkeypatch):
-    monkeypatch.setattr(llm, "nvidia_chat_models", lambda key: ["meta/llama-3.3-70b-instruct", "openai/gpt-oss-120b",
-                                                                "01-ai/yi-large", "zeta/new-chat-instruct"])
-    works = {"openai/gpt-oss-120b", "zeta/new-chat-instruct"}
-    monkeypatch.setattr(llm, "nvidia_model_works", lambda key, m: (m in works, "ok" if m in works else "HTTP 404"))
+    monkeypatch.setattr(llm, "nvidia_chat_models", lambda key: ["deepseek-ai/deepseek-v4.1-flash", "openai/gpt-oss-120b",
+                                                                "01-ai/yi-large", "zeta/glm-5-chat"])
+    reasons = {"openai/gpt-oss-120b": "ok", "zeta/glm-5-chat": "ok", "deepseek-ai/deepseek-v4.1-flash": "timeout"}
+    monkeypatch.setattr(llm, "nvidia_model_works", lambda key, m: (reasons[m] == "ok", reasons[m]))
     working, tested = llm.nvidia_working_models("k")
-    assert working == ["openai/gpt-oss-120b", "zeta/new-chat-instruct"]
-    assert tested["meta/llama-3.3-70b-instruct"] == "HTTP 404" and "01-ai/yi-large" not in tested
+    assert working == ["openai/gpt-oss-120b", "zeta/glm-5-chat"]
+    assert tested["deepseek-ai/deepseek-v4.1-flash"] == "timeout" and "01-ai/yi-large" not in tested
 
 
-def test_nvidia_working_models_stops_on_bad_key(monkeypatch):
-    monkeypatch.setattr(llm, "nvidia_chat_models", lambda key: list(llm.NVIDIA_PREFERRED))
-    monkeypatch.setattr(llm, "nvidia_model_works", lambda key, m: (False, "HTTP 401"))
-    working, tested = llm.nvidia_working_models("bad")
-    assert working == [] and len(tested) == 1
+def test_ai_mode_only_sends_environmental_sentences(monkeypatch):
+    from screener import pipeline
+    sent = []
+
+    def fake_rate(texts, **kw):
+        sent.extend(texts)
+        return [Rating(True, "SPECIFIC", ["x"], source="ai-nvidia") for _ in texts]
+
+    monkeypatch.setattr(llm, "rate_sentences", fake_rate)
+    texts = ["Revenue grew by 8% in 2025.", "We cut Scope 1 emissions by 20% versus 2019.", "Our board met six times."]
+    ratings = pipeline._rate(texts, "nvidia", "k", None, None)
+    assert sent == ["We cut Scope 1 emissions by 20% versus 2019."]
+    assert [r.is_claim for r in ratings] == [False, True, False]

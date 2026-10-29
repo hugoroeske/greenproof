@@ -12,6 +12,7 @@ import json
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib.error
 import urllib.request
 
@@ -23,24 +24,25 @@ NVIDIA_MODELS_URL = "https://integrate.api.nvidia.com/v1/models"
 # NVIDIA retires models regularly and its catalog also lists models an account cannot call.
 # So the app tests candidates with a tiny request and only offers models that answer.
 NVIDIA_PREFERRED = [
-    "meta/llama-3.3-70b-instruct",
+    "deepseek-ai/deepseek-v4.1-flash",
     "openai/gpt-oss-120b",
-    "deepseek-ai/deepseek-v4-flash",
+    "google/gemma-4-31b-it",
+    "openai/gpt-oss-20b",
+    "nvidia/nemotron-3-super-120b-a12b",
     "qwen/qwen3-next-80b-a3b-instruct",
+    "moonshotai/kimi-k2-instruct",
     "meta/llama-4-maverick-17b-128e-instruct",
     "mistralai/mistral-medium-3-instruct",
-    "moonshotai/kimi-k2-instruct",
-    "nvidia/nemotron-3-super-120b-a12b",
-    "openai/gpt-oss-20b",
-    "google/gemma-3-27b-it",
-    "nvidia/llama-3.3-nemotron-super-49b-v1.5",
-    "meta/llama-3.1-8b-instruct",
+    "deepseek-ai/deepseek-v4-flash",
 ]
 NVIDIA_DEFAULT_MODEL = os.environ.get("GREENPROOF_NVIDIA_MODEL", NVIDIA_PREFERRED[0])
 _NOT_CHAT = re.compile(r"embed|rerank|guard|safety|reward|vision|vlm|clip|parse|ocr|retriever|whisper|asr|tts|"
                        r"speech|audio|image|video|diffusion|flux|sdxl|cosmos|detector|pii|nemoretriever|-vl\b|"
                        r"coder|code|math|fuyu|kosmos|deplot|paligemma|neva|translate", re.I)
-_CHAT_HINT = re.compile(r"instruct|chat|-it\b|nemotron|gpt-oss|deepseek|kimi|qwen3", re.I)
+# Only test current model families; the catalog still lists many retired ones (HTTP 404).
+_MODERN = re.compile(r"deepseek-v4|deepseek-v3\.[1-9]|gemma-4|gpt-oss|nemotron-3|qwen3|llama-4|kimi-k2|glm-[45]|"
+                     r"mistral-(?:medium|large)-3|magistral|phi-4", re.I)
+NVIDIA_TEST_TIMEOUT = 90   # free models often need a while to wake up
 
 
 def _nvidia_post(body: dict, api_key: str, timeout: int = 180) -> dict:
@@ -64,36 +66,33 @@ def nvidia_chat_models(api_key: str | None = None) -> list[str]:
 
 
 def nvidia_model_works(api_key: str, model: str) -> tuple[bool, str]:
-    """Send a one-token request. Returns (works, short reason)."""
+    """Send a tiny request. Returns (works, reason): 'ok', 'timeout' or 'HTTP <code>'."""
     try:
         _nvidia_post({"model": model, "messages": [{"role": "user", "content": "Say OK"}], "max_tokens": 5},
-                     api_key, timeout=20)
+                     api_key, timeout=NVIDIA_TEST_TIMEOUT)
         return True, "ok"
     except urllib.error.HTTPError as err:
         return False, f"HTTP {err.code}"
     except Exception as err:  # timeout, cold start, network
-        return False, type(err).__name__
+        return False, "timeout" if "timed out" in str(err).lower() or isinstance(err, TimeoutError) else type(err).__name__
 
 
-def nvidia_working_models(api_key: str, want: int = 4, max_tests: int = 10) -> tuple[list[str], dict[str, str]]:
-    """Test catalog models (preferred first) until `want` of them answer. Returns (working, tested->reason)."""
+def nvidia_working_models(api_key: str, max_tests: int = 8) -> tuple[list[str], dict[str, str]]:
+    """Test current catalog models in parallel. Returns (working models in preferred order, model->reason)."""
     try:
         catalog = nvidia_chat_models(api_key)
     except Exception:
         catalog = []
     candidates = [m for m in NVIDIA_PREFERRED if m in catalog or not catalog]
-    candidates += [m for m in catalog if m not in candidates and _CHAT_HINT.search(m)]
-    working, tested = [], {}
-    for model in candidates[:max_tests]:
-        ok, reason = nvidia_model_works(api_key, model)
-        tested[model] = reason
-        if ok:
-            working.append(model)
-            if len(working) >= want:
-                break
-        elif reason == "HTTP 401":  # bad key: no point testing more models
-            break
-    return working, tested
+    candidates += [m for m in catalog if m not in candidates and _MODERN.search(m)]
+    candidates = candidates[:max_tests]
+    tested: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=len(candidates) or 1) as pool:
+        futures = {pool.submit(nvidia_model_works, api_key, m): m for m in candidates}
+        for future in as_completed(futures):
+            tested[futures[future]] = future.result()[1]
+    tested = {m: tested[m] for m in candidates}
+    return [m for m in candidates if tested[m] == "ok"], tested
 
 
 BATCH_SIZE = 25
@@ -150,7 +149,7 @@ def _ask_nvidia(payload: str, api_key: str, model: str, retries: int = 4) -> str
     }
     for attempt in range(retries + 1):
         try:
-            data = _nvidia_post(body, api_key)
+            data = _nvidia_post(body, api_key, timeout=300)
             return data["choices"][0]["message"]["content"] or ""
         except urllib.error.HTTPError as err:
             if err.code == 429 and attempt < retries:   # rate limit: wait and try again
@@ -170,20 +169,31 @@ def rate_sentences(sentences: list[str], api_key: str, model: str | None = None,
     model = model or (NVIDIA_DEFAULT_MODEL if provider == "nvidia" else DEFAULT_MODEL)
     source = "ai-nvidia" if provider == "nvidia" else "ai"
     ratings: list[Rating] = [Rating(False, source=source)] * len(sentences)
-    for start in range(0, len(sentences), BATCH_SIZE):
-        batch = sentences[start:start + BATCH_SIZE]
-        payload = "Rate these sentences:\n" + "\n".join(f"{i}: {s}" for i, s in enumerate(batch))
-        for item in _parse(ask(payload, api_key, model)):
-            try:
-                idx = start + int(item["id"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            if not start <= idx < start + len(batch):
-                continue
-            category = item.get("category") or "OTHER"
-            if category not in CATEGORIES:
-                category = "OTHER"
-            ratings[idx] = Rating(bool(item.get("is_claim")), category, [str(item.get("reason", ""))], source=source)
-        if progress:
-            progress(min(start + BATCH_SIZE, len(sentences)) / len(sentences))
+    starts = list(range(0, len(sentences), BATCH_SIZE))
+
+    def run(start: int) -> tuple[int, list[dict]]:
+        payload = "Rate these sentences:\n" + "\n".join(
+            f"{i}: {s}" for i, s in enumerate(sentences[start:start + BATCH_SIZE]))
+        return start, _parse(ask(payload, api_key, model))
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=4) as pool:   # 4 batches at a time, well below the rate limits
+        for future in as_completed([pool.submit(run, st) for st in starts]):
+            start, items = future.result()
+            size = min(BATCH_SIZE, len(sentences) - start)
+            for item in items:
+                try:
+                    idx = start + int(item["id"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if not start <= idx < start + size:
+                    continue
+                category = item.get("category") or "OTHER"
+                if category not in CATEGORIES:
+                    category = "OTHER"
+                ratings[idx] = Rating(bool(item.get("is_claim")), category, [str(item.get("reason", ""))],
+                                      source=source)
+            done += 1
+            if progress:
+                progress(done / len(starts))
     return ratings
