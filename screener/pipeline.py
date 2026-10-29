@@ -13,6 +13,7 @@ MODES = {
     "rules": "Rules (transparent, free, offline)",
     "climatebert": "ClimateBERT detection + rules",
     "ai": "AI (Claude API) – detection and rating",
+    "nvidia": "AI (NVIDIA API, open models) – detection and rating",
 }
 CLAIM_COLUMNS = ["company", "page", "claim", "category", "light", "light_icon", "points",
                  "why", "explanation", "method", "hand_label"]
@@ -36,9 +37,10 @@ class ReportResult:
 
 
 def _rate(texts: list[str], mode: str, api_key: str | None, model: str | None, progress) -> list[Rating]:
-    if mode == "ai":
+    if mode in ("ai", "nvidia"):
         from . import llm
-        return llm.rate_sentences(texts, api_key=api_key, model=model or llm.DEFAULT_MODEL, progress=progress)
+        provider = "nvidia" if mode == "nvidia" else "anthropic"
+        return llm.rate_sentences(texts, api_key=api_key, model=model, progress=progress, provider=provider)
     if mode == "climatebert":
         from . import climatebert
         flags = climatebert.detect_claims(texts, progress=progress)

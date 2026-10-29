@@ -1,17 +1,25 @@
-"""Optional AI mode: let a Claude model detect and rate claims with the same rubric.
+"""Optional AI mode: let a language model detect and rate claims with the same rubric.
 
-Needs an Anthropic API key (https://console.anthropic.com). Without a key the screener
-simply uses the rule-based mode.
+Two providers:
+- "anthropic": Claude via an Anthropic API key (https://console.anthropic.com)
+- "nvidia":    open models (Llama, DeepSeek, ...) via an NVIDIA API key from https://build.nvidia.com
+               (OpenAI-compatible endpoint, free developer credits)
+Without a key the screener simply uses the rule-based mode.
 """
 from __future__ import annotations
 
 import json
 import os
 import re
+import time
+import urllib.error
+import urllib.request
 
 from .classify import CATEGORIES, Rating
 
 DEFAULT_MODEL = os.environ.get("GREENPROOF_MODEL", "claude-sonnet-5-5")
+NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
+NVIDIA_DEFAULT_MODEL = os.environ.get("GREENPROOF_NVIDIA_MODEL", "meta/llama-3.1-70b-instruct")
 BATCH_SIZE = 25
 
 SYSTEM_PROMPT = """You are an expert on EU green-claims rules (Directive (EU) 2024/825, applying from 27 September 2026).
@@ -37,35 +45,70 @@ Answer ONLY with a JSON array: [{"id": <int>, "is_claim": <bool>, "category": "<
 
 
 def _parse(text: str) -> list[dict]:
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)  # reasoning models think out loud first
     match = re.search(r"\[.*\]", text, re.DOTALL)
     if not match:
         raise ValueError("No JSON array in model answer")
     return json.loads(match.group(0))
 
 
-def rate_sentences(sentences: list[str], api_key: str, model: str = DEFAULT_MODEL, progress=None) -> list[Rating]:
+def _ask_anthropic(payload: str, api_key: str, model: str) -> str:
     import anthropic  # imported here so the rule-based mode works without the package
 
     client = anthropic.Anthropic(api_key=api_key)
-    ratings: list[Rating] = [Rating(False, source="ai")] * len(sentences)
+    response = client.messages.create(
+        model=model,
+        max_tokens=4000,
+        system=SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": payload}],
+    )
+    return "".join(block.text for block in response.content if getattr(block, "type", "") == "text")
+
+
+def _ask_nvidia(payload: str, api_key: str, model: str, retries: int = 4) -> str:
+    body = json.dumps({
+        "model": model,
+        "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": payload}],
+        "temperature": 0,          # same input -> (almost) same answer
+        "max_tokens": 4000,
+    }).encode()
+    request = urllib.request.Request(NVIDIA_URL, data=body, method="POST", headers={
+        "Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "Accept": "application/json"})
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(request, timeout=180) as response:
+                data = json.loads(response.read())
+            return data["choices"][0]["message"]["content"] or ""
+        except urllib.error.HTTPError as err:
+            if err.code == 429 and attempt < retries:   # rate limit: wait and try again
+                time.sleep(float(err.headers.get("Retry-After") or 15))
+                continue
+            detail = err.read().decode(errors="ignore")[:300]
+            hint = {401: "API key invalid", 402: "NVIDIA credits used up", 404: "model name not found"}.get(err.code, "")
+            raise RuntimeError(f"NVIDIA API error {err.code} {hint}: {detail}") from err
+    raise RuntimeError("NVIDIA API: rate limit, try again in a minute")
+
+
+def rate_sentences(sentences: list[str], api_key: str, model: str | None = None, progress=None,
+                   provider: str = "anthropic") -> list[Rating]:
+    ask = _ask_nvidia if provider == "nvidia" else _ask_anthropic
+    model = model or (NVIDIA_DEFAULT_MODEL if provider == "nvidia" else DEFAULT_MODEL)
+    source = "ai-nvidia" if provider == "nvidia" else "ai"
+    ratings: list[Rating] = [Rating(False, source=source)] * len(sentences)
     for start in range(0, len(sentences), BATCH_SIZE):
         batch = sentences[start:start + BATCH_SIZE]
-        payload = "\n".join(f"{i}: {s}" for i, s in enumerate(batch))
-        response = client.messages.create(
-            model=model,
-            max_tokens=4000,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": f"Rate these sentences:\n{payload}"}],
-        )
-        answer = "".join(block.text for block in response.content if getattr(block, "type", "") == "text")
-        for item in _parse(answer):
-            idx = start + int(item["id"])
-            if not 0 <= idx < len(sentences):
+        payload = "Rate these sentences:\n" + "\n".join(f"{i}: {s}" for i, s in enumerate(batch))
+        for item in _parse(ask(payload, api_key, model)):
+            try:
+                idx = start + int(item["id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if not start <= idx < start + len(batch):
                 continue
             category = item.get("category") or "OTHER"
             if category not in CATEGORIES:
                 category = "OTHER"
-            ratings[idx] = Rating(bool(item.get("is_claim")), category, [item.get("reason", "")], source="ai")
+            ratings[idx] = Rating(bool(item.get("is_claim")), category, [str(item.get("reason", ""))], source=source)
         if progress:
             progress(min(start + BATCH_SIZE, len(sentences)) / len(sentences))
     return ratings

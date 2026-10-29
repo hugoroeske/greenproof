@@ -41,7 +41,7 @@ def run_screening(pdf_bytes: bytes, company: str, mode: str, api_key: str | None
 # ---------------------------------------------------------------- sidebar
 with st.sidebar:
     st.header("⚙️ Settings")
-    mode = st.radio("Screening mode", ["rules", "climatebert", "ai"], format_func=lambda m: MODES[m])
+    mode = st.radio("Screening mode", ["rules", "climatebert", "ai", "nvidia"], format_func=lambda m: MODES[m])
     api_key, model = None, None
     if mode == "climatebert" and not climatebert.available():
         st.warning("ClimateBERT needs `pip install transformers torch`. Falling back to rules.")
@@ -52,6 +52,13 @@ with st.sidebar:
         model = st.text_input("Model", value=os.environ.get("GREENPROOF_MODEL", "claude-sonnet-5-5"))
         if not api_key:
             st.info("Enter an API key to use the AI mode.")
+    if mode == "nvidia":
+        api_key = st.text_input("NVIDIA API key (nvapi-…)", type="password", value=os.environ.get("NVIDIA_API_KEY", ""),
+                                help="Create one at build.nvidia.com → API keys. Only kept in this browser session.")
+        model = st.text_input("Model", value=os.environ.get("GREENPROOF_NVIDIA_MODEL", "meta/llama-3.1-70b-instruct"),
+                              help="Any chat model ID from build.nvidia.com, e.g. deepseek-ai/deepseek-v3.1")
+        if not api_key:
+            st.info("Enter an NVIDIA API key to use this mode.")
     st.divider()
     use_demo = st.checkbox("Use the 3 fictional demo reports", value=False)
     st.caption("GreenProof rates claims against the EU green-claims rules applying from 27 Sep 2026 "
@@ -71,7 +78,7 @@ if files:
     names = pd.DataFrame({"file": [f for f, _ in files], "company": [company_from_filename(f) for f, _ in files]})
     names = st.data_editor(names, disabled=["file"], hide_index=True, width="stretch",
                            key="names_" + "_".join(f for f, _ in files))
-    if st.button("🔍 Screen reports", type="primary", disabled=(mode == "ai" and not api_key)):
+    if st.button("🔍 Screen reports", type="primary", disabled=(mode in ("ai", "nvidia") and not api_key)):
         results, bar = [], st.progress(0.0, text="Starting …")
         for i, ((fname, data), company) in enumerate(zip(files, names["company"])):
             bar.progress(i / len(files), text=f"Screening {company} …")

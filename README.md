@@ -29,13 +29,14 @@ PDF ─► extract text ─┬─► sentences ─► detect claims ─► rate 
 | Score | Claim Quality (🟢 100 · 🟡 50 · 🔴 0), Evidence (10 pts per item), Overall = average | `screener/pipeline.py` |
 | Validate | Agreement with hand labels: accuracy, Cohen's kappa, confusion matrix | `screener/validation.py` |
 
-### Three screening modes
+### Four screening modes
 
 | Mode | Claim detection | Claim rating | Needs |
 |---|---|---|---|
 | **Rules** (default) | Keyword rules | Keyword rules | Nothing – free, offline, fully transparent |
 | **ClimateBERT + rules** | `climatebert/environmental-claims` (Stammbach et al., ACL 2023) | Keyword rules | `pip install transformers torch` |
 | **AI (Claude API)** | Claude | Claude, same rubric | Anthropic API key |
+| **AI (NVIDIA API)** | Open model, e.g. Llama 3.1 70B | Same model, same rubric | NVIDIA API key from build.nvidia.com (free credits) |
 
 The Evidence Score is always rule-based, so it is identical in all modes.
 
@@ -73,7 +74,7 @@ Cohen's kappa. Or download the claims CSV, fill `hand_label` and run `python val
 ## Tests
 
 ```bash
-python -m pytest -q          # 39 tests: rules, evidence checklist, pipeline, AI mode (mocked), validation
+python -m pytest -q          # 41 tests: rules, evidence checklist, pipeline, AI modes (mocked), validation
 ```
 
 ## Project structure
@@ -89,7 +90,7 @@ screener/
   evidence.py           GRI 305 / GRI 102 evidence checklist
   pipeline.py           Runs everything, builds company scores and quadrants
   validation.py         Accuracy, Cohen's kappa, confusion matrix
-  llm.py                Optional Claude API mode
+  llm.py                Optional AI mode (Claude API or NVIDIA API)
   climatebert.py        Optional ClimateBERT detection
 demo/                   3 fictional demo reports + generator script
 docs/                   Project overview PDF for the group
