@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# Company reports and results stay in Google Drive, not on GitHub
+reports/*.pdf
+results/*.csv
+
+# Keys
+.env
+.streamlit/secrets.toml
+
+# macOS
+.DS_Store
