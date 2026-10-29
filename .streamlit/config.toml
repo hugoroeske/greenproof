@@ -1,0 +1,43 @@
+# GreenProof theme: soft light and dark variants. The app follows the device
+# by default; the sidebar switch in app.py can force light or dark.
+# Keep these colours in sync with THEMES in app.py (tests/test_app.py checks it).
+
+[theme]
+font = "sans-serif"
+headingFont = "sans-serif"
+baseRadius = "0.75rem"
+buttonRadius = "0.75rem"
+showWidgetBorder = true
+showSidebarBorder = false
+
+[theme.light]
+primaryColor = "#3F8F5F"
+backgroundColor = "#F7F8F4"
+secondaryBackgroundColor = "#EDF1EA"
+textColor = "#1F2A24"
+borderColor = "#DCE3DA"
+dataframeBorderColor = "#E3E8E1"
+greenColor = "#3F8F5F"
+yellowColor = "#D9A23B"
+redColor = "#C4574C"
+grayColor = "#9AA29D"
+
+[theme.light.sidebar]
+backgroundColor = "#EEF2EB"
+secondaryBackgroundColor = "#E3E9E0"
+
+[theme.dark]
+primaryColor = "#6CBF8C"
+backgroundColor = "#141B17"
+secondaryBackgroundColor = "#1E2822"
+textColor = "#E3EAE5"
+borderColor = "#2D3A32"
+dataframeBorderColor = "#2A362F"
+greenColor = "#6CBF8C"
+yellowColor = "#E2B24E"
+redColor = "#E0766A"
+grayColor = "#8D9690"
+
+[theme.dark.sidebar]
+backgroundColor = "#18211C"
+secondaryBackgroundColor = "#222D27"
