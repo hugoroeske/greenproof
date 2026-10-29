@@ -12,21 +12,20 @@ Writes:
 from __future__ import annotations
 
 import argparse
-import re
 import sys
 from pathlib import Path
 
 import pandas as pd
 
+from screener.naming import company_from_filename
 from screener.pipeline import screen
 
 SEED = 42
 
 
 def company_name(pdf: Path) -> str:
-    """'asus_2025.pdf' -> 'asus'; 'Lumen_Devices_2025.pdf' -> 'Lumen Devices'."""
-    stem = re.sub(r"[_-]?(19|20)\d\d.*$", "", pdf.stem)
-    return stem.replace("_", " ").replace("-", " ").strip() or pdf.stem
+    """'asus_2025.pdf' -> 'asus'; '2024_Acer_Sustainability_Report.pdf' -> 'Acer'."""
+    return company_from_filename(pdf)
 
 
 def run(reports: Path, out: Path) -> tuple[pd.DataFrame, pd.DataFrame]:

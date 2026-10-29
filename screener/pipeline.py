@@ -39,8 +39,21 @@ class ReportResult:
 def _rate(texts: list[str], mode: str, api_key: str | None, model: str | None, progress) -> list[Rating]:
     if mode in ("ai", "nvidia"):
         from . import llm
+        from . import rules
         provider = "nvidia" if mode == "nvidia" else "anthropic"
-        return llm.rate_sentences(texts, api_key=api_key, model=model, progress=progress, provider=provider)
+        # Only sentences with an environmental keyword go to the AI (broad filter: much faster and cheaper,
+        # the AI still decides whether each one is a claim and which category it gets).
+        idx = [i for i, t in enumerate(texts)
+               if rules.ENVIRONMENT.search(t) or rules.GENERIC.search(t) or rules.NEUTRALITY.search(t)]
+        ratings = [Rating(False, source="ai-nvidia" if provider == "nvidia" else "ai")] * len(texts)
+        if idx:
+            rated = llm.rate_sentences([texts[i] for i in idx], api_key=api_key, model=model,
+                                       progress=progress, provider=provider)
+            for i, r in zip(idx, rated):
+                ratings[i] = r
+        elif progress:
+            progress(1.0)
+        return ratings
     if mode == "climatebert":
         from . import climatebert
         flags = climatebert.detect_claims(texts, progress=progress)

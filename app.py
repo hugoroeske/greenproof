@@ -5,15 +5,15 @@ Start with:  streamlit run app.py
 from __future__ import annotations
 
 import os
-import re
 from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from screener import climatebert
+from screener import climatebert, llm
 from screener.classify import CATEGORIES
+from screener.naming import company_from_filename
 from screener.pipeline import MODES, ReportResult, category_counts, company_summary, screen
 from screener.validation import agreement, kappa_label
 
@@ -43,10 +43,9 @@ VIEWS = {"Ranking": ":material/leaderboard: Ranking", "Company detail": ":materi
 st.set_page_config(page_title="GreenProof – Greenwashing Screener", page_icon=":material/eco:", layout="wide")
 
 
-def company_from_filename(name: str) -> str:
-    stem = Path(name).stem
-    stem = re.sub(r"[_-]?(19|20)\d\d.*$", "", stem)          # drop year suffixes like _2025
-    return stem.replace("_", " ").replace("-", " ").strip() or name
+@st.cache_data(ttl=900, show_spinner=False)
+def nvidia_models(api_key: str) -> tuple[list[str], dict[str, str]]:
+    return llm.nvidia_working_models(api_key)
 
 
 @st.cache_data(show_spinner=False)
@@ -220,8 +219,28 @@ with st.sidebar:
     if mode == "nvidia":
         api_key = st.text_input("NVIDIA API key (nvapi-…)", type="password", value=os.environ.get("NVIDIA_API_KEY", ""),
                                 help="Create one at build.nvidia.com → API keys. Only kept in this browser session.")
-        model = st.text_input("Model", value=os.environ.get("GREENPROOF_NVIDIA_MODEL", "meta/llama-3.1-70b-instruct"),
-                              help="Any chat model ID from build.nvidia.com, e.g. deepseek-ai/deepseek-v3.1")
+        options, tested = [], {}
+        if api_key:
+            with st.spinner("Testing which NVIDIA models your key can use (up to 90 s) …"):
+                options, tested = nvidia_models(api_key)
+        if options:
+            model = st.selectbox("Model", options, index=0,
+                                 help="Only models that just answered a test request with your key.")
+            st.caption(f"{len(options)} working model(s) found.")
+        else:
+            if api_key:
+                if any(r == "HTTP 401" for r in tested.values()):
+                    st.error("NVIDIA rejected the key (401). Create a new one at build.nvidia.com → API keys.")
+                else:
+                    slow = [m for m, r in tested.items() if r == "timeout"]
+                    st.warning("No model answered within 90 s. NVIDIA's free models are sometimes busy – "
+                               "try again in a few minutes" + (f", or type one of the slow ones below, e.g. `{slow[0]}`."
+                                                               if slow else "."))
+            model = st.text_input("Model", value=llm.NVIDIA_DEFAULT_MODEL,
+                                  help="Any chat model ID from build.nvidia.com/models")
+        if tested:
+            with st.expander("Model test details"):
+                st.write({m: ("✅ works" if r == "ok" else f"❌ {r}") for m, r in tested.items()})
     st.caption("GreenProof rates claims against the EU green-claims rules applying from 27 Sep 2026 "
                "(Directive (EU) 2024/825) and checks GHG disclosure along GRI 305 / GRI 102. "
                "It flags greenwashing *risk*, it is not a legal opinion.")

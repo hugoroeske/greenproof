@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pandas as pd
 
 from screener import llm
+from screener.classify import Rating
 from screener.pipeline import company_summary, screen_report
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -87,5 +88,53 @@ def test_nvidia_mode_with_fake_api(monkeypatch):
 def test_nvidia_bad_key_gives_clear_error(monkeypatch):
     import pytest
     _fake_nvidia(monkeypatch, "[]", fail_first_with=401)
-    with pytest.raises(RuntimeError, match="401 API key invalid"):
+    with pytest.raises(RuntimeError, match=r"401 \(API key invalid\)"):
         llm.rate_sentences(["Our shoes are eco-friendly."], api_key="bad", provider="nvidia")
+
+
+def test_nvidia_model_list_prefers_recommended(monkeypatch):
+    import urllib.request
+    catalog = {"data": [{"id": i} for i in ["nvidia/nv-embedqa-e5-v5", "zeta/some-chat-model",
+                                             "deepseek-ai/deepseek-v4-flash", "meta/llama-guard-4-12b",
+                                             "meta/llama-3.3-70b-instruct"]]}
+
+    class Resp:
+        def __enter__(self): return SimpleNamespace(read=lambda: json.dumps(catalog).encode())
+        def __exit__(self, *a): return False
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout=None: Resp())
+    assert llm.nvidia_chat_models("k") == ["deepseek-ai/deepseek-v4-flash", "meta/llama-3.3-70b-instruct",
+                                           "zeta/some-chat-model"]
+
+
+def test_company_from_filename():
+    from screener.naming import company_from_filename as c
+    assert c("2024_Acer_Sustainability_Report.pdf") == "Acer"
+    assert c("ASUS_Detailed_2025_EN.pdf") == "ASUS"
+    assert c("GBEN_Apple_Environmental_Progress_Report_2025.pdf") == "Apple"
+    assert c("Lumen_Devices_2025.pdf") == "Lumen Devices"
+
+
+def test_nvidia_working_models_skips_unavailable(monkeypatch):
+    monkeypatch.setattr(llm, "nvidia_chat_models", lambda key: ["deepseek-ai/deepseek-v4.1-flash", "openai/gpt-oss-120b",
+                                                                "01-ai/yi-large", "zeta/glm-5-chat"])
+    reasons = {"openai/gpt-oss-120b": "ok", "zeta/glm-5-chat": "ok", "deepseek-ai/deepseek-v4.1-flash": "timeout"}
+    monkeypatch.setattr(llm, "nvidia_model_works", lambda key, m: (reasons[m] == "ok", reasons[m]))
+    working, tested = llm.nvidia_working_models("k")
+    assert working == ["openai/gpt-oss-120b", "zeta/glm-5-chat"]
+    assert tested["deepseek-ai/deepseek-v4.1-flash"] == "timeout" and "01-ai/yi-large" not in tested
+
+
+def test_ai_mode_only_sends_environmental_sentences(monkeypatch):
+    from screener import pipeline
+    sent = []
+
+    def fake_rate(texts, **kw):
+        sent.extend(texts)
+        return [Rating(True, "SPECIFIC", ["x"], source="ai-nvidia") for _ in texts]
+
+    monkeypatch.setattr(llm, "rate_sentences", fake_rate)
+    texts = ["Revenue grew by 8% in 2025.", "We cut Scope 1 emissions by 20% versus 2019.", "Our board met six times."]
+    ratings = pipeline._rate(texts, "nvidia", "k", None, None)
+    assert sent == ["We cut Scope 1 emissions by 20% versus 2019."]
+    assert [r.is_claim for r in ratings] == [False, True, False]
