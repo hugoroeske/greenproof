@@ -5,15 +5,15 @@ Start with:  streamlit run app.py
 from __future__ import annotations
 
 import os
-import re
 from pathlib import Path
 
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-from screener import climatebert
+from screener import climatebert, llm
 from screener.classify import CATEGORIES
+from screener.naming import company_from_filename
 from screener.pipeline import MODES, ReportResult, category_counts, company_summary, screen
 from screener.validation import agreement, kappa_label
 
@@ -27,10 +27,9 @@ QUADRANT_COLORS = {"Credible": "#2E7D32", "Careful claims, thin data": "#F9A825"
 st.set_page_config(page_title="GreenProof – Greenwashing Screener", page_icon="🌿", layout="wide")
 
 
-def company_from_filename(name: str) -> str:
-    stem = Path(name).stem
-    stem = re.sub(r"[_-]?(19|20)\d\d.*$", "", stem)          # drop year suffixes like _2025
-    return stem.replace("_", " ").replace("-", " ").strip() or name
+@st.cache_data(ttl=3600, show_spinner=False)
+def nvidia_models(api_key: str | None) -> list[str]:
+    return llm.nvidia_chat_models(api_key)
 
 
 @st.cache_data(show_spinner=False)
@@ -55,8 +54,16 @@ with st.sidebar:
     if mode == "nvidia":
         api_key = st.text_input("NVIDIA API key (nvapi-…)", type="password", value=os.environ.get("NVIDIA_API_KEY", ""),
                                 help="Create one at build.nvidia.com → API keys. Only kept in this browser session.")
-        model = st.text_input("Model", value=os.environ.get("GREENPROOF_NVIDIA_MODEL", "meta/llama-3.1-70b-instruct"),
-                              help="Any chat model ID from build.nvidia.com, e.g. deepseek-ai/deepseek-v3.1")
+        try:
+            options = nvidia_models(api_key or None)
+        except Exception:  # catalog not reachable: let the user type a model ID
+            options = []
+        if options:
+            model = st.selectbox("Model", options, index=0,
+                                 help="Live list from build.nvidia.com. Recommended models are at the top.")
+        else:
+            model = st.text_input("Model", value=llm.NVIDIA_DEFAULT_MODEL,
+                                  help="Any chat model ID from build.nvidia.com/models")
         if not api_key:
             st.info("Enter an NVIDIA API key to use this mode.")
     st.divider()

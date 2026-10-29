@@ -19,7 +19,31 @@ from .classify import CATEGORIES, Rating
 
 DEFAULT_MODEL = os.environ.get("GREENPROOF_MODEL", "claude-sonnet-5-5")
 NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
-NVIDIA_DEFAULT_MODEL = os.environ.get("GREENPROOF_NVIDIA_MODEL", "meta/llama-3.1-70b-instruct")
+NVIDIA_MODELS_URL = "https://integrate.api.nvidia.com/v1/models"
+# NVIDIA retires models regularly, so the app asks the live catalog and picks the first of these that still exists.
+NVIDIA_PREFERRED = [
+    "meta/llama-3.3-70b-instruct",
+    "deepseek-ai/deepseek-v4-flash",
+    "openai/gpt-oss-120b",
+    "nvidia/nemotron-3-super-120b-a12b",
+    "deepseek-ai/deepseek-v4-pro",
+]
+NVIDIA_DEFAULT_MODEL = os.environ.get("GREENPROOF_NVIDIA_MODEL", NVIDIA_PREFERRED[0])
+_NOT_CHAT = re.compile(r"embed|rerank|guard|safety|reward|vision|vlm|clip|parse|ocr|retriever|whisper|asr|tts|"
+                       r"speech|audio|image|video|diffusion|flux|sdxl|cosmos|detector|pii|nemoretriever|-vl\b", re.I)
+
+
+def nvidia_chat_models(api_key: str | None = None) -> list[str]:
+    """Live list of chat models in the NVIDIA catalog, preferred models first."""
+    headers = {"Accept": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    request = urllib.request.Request(NVIDIA_MODELS_URL, headers=headers)
+    with urllib.request.urlopen(request, timeout=30) as response:
+        ids = [m["id"] for m in json.loads(response.read()).get("data", [])]
+    chat = sorted({i for i in ids if not _NOT_CHAT.search(i)})
+    preferred = [m for m in NVIDIA_PREFERRED if m in chat]
+    return preferred + [m for m in chat if m not in preferred]
 BATCH_SIZE = 25
 
 SYSTEM_PROMPT = """You are an expert on EU green-claims rules (Directive (EU) 2024/825, applying from 27 September 2026).
@@ -70,7 +94,7 @@ def _ask_nvidia(payload: str, api_key: str, model: str, retries: int = 4) -> str
         "model": model,
         "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": payload}],
         "temperature": 0,          # same input -> (almost) same answer
-        "max_tokens": 4000,
+        "max_tokens": 8000,     # reasoning models need room to think
     }).encode()
     request = urllib.request.Request(NVIDIA_URL, data=body, method="POST", headers={
         "Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "Accept": "application/json"})
@@ -84,7 +108,8 @@ def _ask_nvidia(payload: str, api_key: str, model: str, retries: int = 4) -> str
                 time.sleep(float(err.headers.get("Retry-After") or 15))
                 continue
             detail = err.read().decode(errors="ignore")[:300]
-            hint = {401: "API key invalid", 402: "NVIDIA credits used up", 404: "model name not found"}.get(err.code, "")
+            hint = {401: "API key invalid", 402: "NVIDIA credits used up", 404: "model name not found",
+                    410: "model retired by NVIDIA, pick another model"}.get(err.code, "")
             raise RuntimeError(f"NVIDIA API error {err.code} {hint}: {detail}") from err
     raise RuntimeError("NVIDIA API: rate limit, try again in a minute")
 
