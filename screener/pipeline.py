@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 
 import pandas as pd
 
-from .classify import CATEGORIES, LIGHT_EMOJI, Rating, classify, rate_sentence
+from .classify import CATEGORIES, LIGHT_EMOJI, Rating, classify, is_environmental_claim, rate_sentence
 from .evidence import EvidenceHit, check_evidence, evidence_score
 from .extract import extract_pages, sentences_from_pages
 
@@ -36,15 +36,20 @@ class ReportResult:
                               "found": h.found, "page": h.page, "where": h.snippet} for h in self.evidence])
 
 
-def _rate(texts: list[str], mode: str, api_key: str | None, model: str | None, progress) -> list[Rating]:
+def _rate(texts: list[str], mode: str, api_key: str | None, model: str | None, progress,
+          ai_scope: str = "claims") -> list[Rating]:
     if mode in ("ai", "nvidia"):
         from . import llm
         from . import rules
         provider = "nvidia" if mode == "nvidia" else "anthropic"
-        # Only sentences with an environmental keyword go to the AI (broad filter: much faster and cheaper,
-        # the AI still decides whether each one is a claim and which category it gets).
-        idx = [i for i, t in enumerate(texts)
-               if rules.ENVIRONMENT.search(t) or rules.GENERIC.search(t) or rules.NEUTRALITY.search(t)]
+        # Which sentences go to the AI (it still decides "claim or not" and the category):
+        #   "claims": sentences the rules detect as claims – fast, the AI acts as a second rater
+        #   "all":    every sentence with an environmental keyword – thorough, about 3x slower
+        if ai_scope == "all":
+            idx = [i for i, t in enumerate(texts)
+                   if rules.ENVIRONMENT.search(t) or rules.GENERIC.search(t) or rules.NEUTRALITY.search(t)]
+        else:
+            idx = [i for i, t in enumerate(texts) if is_environmental_claim(t)]
         ratings = [Rating(False, source="ai-nvidia" if provider == "nvidia" else "ai")] * len(texts)
         if idx:
             rated = llm.rate_sentences([texts[i] for i in idx], api_key=api_key, model=model,
@@ -64,10 +69,10 @@ def _rate(texts: list[str], mode: str, api_key: str | None, model: str | None, p
 
 
 def screen(pdf_bytes: bytes, company: str, mode: str = "rules", api_key: str | None = None,
-           model: str | None = None, progress=None) -> ReportResult:
+           model: str | None = None, progress=None, ai_scope: str = "claims") -> ReportResult:
     pages = extract_pages(pdf_bytes)
     sentences = sentences_from_pages(pages)
-    ratings = _rate([s.text for s in sentences], mode, api_key, model, progress)
+    ratings = _rate([s.text for s in sentences], mode, api_key, model, progress, ai_scope)
 
     rows = []
     for s, r in zip(sentences, ratings):

@@ -162,3 +162,27 @@ def test_progress_reaches_one(monkeypatch):
     seen = []
     llm.rate_sentences(["We cut emissions."] * (llm.BATCH_SIZE * 3), api_key="k", provider="nvidia", progress=seen.append)
     assert len(seen) == 3 and seen[-1] == 1.0
+
+
+def test_compact_answer_format_lists_only_claims(monkeypatch):
+    monkeypatch.setattr(llm, "_ask_nvidia", lambda payload, key, model: '[{"id": 1, "c": "vague", "r": "committed to"}]')
+    ratings = llm.rate_sentences(["Revenue grew.", "We are committed to the planet."], api_key="k", provider="nvidia")
+    assert not ratings[0].is_claim
+    assert ratings[1].is_claim and ratings[1].category == "VAGUE" and ratings[1].evidence == ["committed to"]
+
+
+def test_nvidia_drops_no_thinking_switch_when_model_refuses(monkeypatch):
+    import io
+    import urllib.error
+    bodies = []
+
+    def fake_post(body, api_key, timeout=180):
+        bodies.append(body)
+        if "chat_template_kwargs" in body:
+            raise urllib.error.HTTPError("u", 400, "bad", {}, io.BytesIO(b"unknown field"))
+        return {"choices": [{"message": {"content": "[]"}}]}
+
+    monkeypatch.setattr(llm, "_nvidia_post", fake_post)
+    llm._no_thinking_refused.discard("x/strict-model")
+    assert llm._ask_nvidia("Rate these sentences:\n0: hi", "k", "x/strict-model") == "[]"
+    assert "chat_template_kwargs" in bodies[0] and "chat_template_kwargs" not in bodies[1]

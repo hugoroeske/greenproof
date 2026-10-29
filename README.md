@@ -74,7 +74,7 @@ Cohen's kappa. Or download the claims CSV, fill `hand_label` and run `python val
 ## Tests
 
 ```bash
-python -m pytest -q          # 54 tests: rules, evidence checklist, pipeline, AI modes (mocked), validation, app views
+python -m pytest -q          # 56 tests: rules, evidence checklist, pipeline, AI modes (mocked), validation, app views
 ```
 
 ## Project structure

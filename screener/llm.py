@@ -67,18 +67,24 @@ def nvidia_chat_models(api_key: str | None = None) -> list[str]:
 
 def nvidia_model_works(api_key: str, model: str) -> tuple[bool, str]:
     """Send a tiny request. Returns (works, reason): 'ok', 'timeout' or 'HTTP <code>'."""
-    try:
-        _nvidia_post({"model": model, "messages": [{"role": "user", "content": "Say OK"}], "max_tokens": 5},
-                     api_key, timeout=NVIDIA_TEST_TIMEOUT)
-        return True, "ok"
-    except urllib.error.HTTPError as err:
-        return False, f"HTTP {err.code}"
-    except Exception as err:  # timeout, cold start, network
-        return False, "timeout" if "timed out" in str(err).lower() or isinstance(err, TimeoutError) else type(err).__name__
+    messages = [{"role": "user", "content": "Say OK"}]
+    for _ in range(2):
+        try:
+            _nvidia_post(_nvidia_body(model, messages, 5), api_key, timeout=NVIDIA_TEST_TIMEOUT)
+            return True, "ok"
+        except urllib.error.HTTPError as err:
+            if err.code == 400 and model not in _no_thinking_refused:
+                _no_thinking_refused.add(model)
+                continue
+            return False, f"HTTP {err.code}"
+        except Exception as err:  # timeout, cold start, network
+            return False, "timeout" if "timed out" in str(err).lower() or isinstance(err, TimeoutError) \
+                else type(err).__name__
+    return False, "HTTP 400"
 
 
 def nvidia_working_models(api_key: str, max_tests: int = 8) -> tuple[list[str], dict[str, str]]:
-    """Test current catalog models in parallel. Returns (working models in preferred order, model->reason)."""
+    """Test current catalog models in parallel. Returns (working models, fastest first; model -> result)."""
     try:
         catalog = nvidia_chat_models(api_key)
     except Exception:
@@ -86,37 +92,45 @@ def nvidia_working_models(api_key: str, max_tests: int = 8) -> tuple[list[str], 
     candidates = [m for m in NVIDIA_PREFERRED if m in catalog or not catalog]
     candidates += [m for m in catalog if m not in candidates and _MODERN.search(m)]
     candidates = candidates[:max_tests]
-    tested: dict[str, str] = {}
+
+    def timed(model: str) -> tuple[bool, str, float]:
+        t0 = time.time()
+        ok, reason = nvidia_model_works(api_key, model)
+        return ok, reason, time.time() - t0
+
+    results: dict[str, tuple[bool, str, float]] = {}
     with ThreadPoolExecutor(max_workers=len(candidates) or 1) as pool:
-        futures = {pool.submit(nvidia_model_works, api_key, m): m for m in candidates}
+        futures = {pool.submit(timed, m): m for m in candidates}
         for future in as_completed(futures):
-            tested[futures[future]] = future.result()[1]
-    tested = {m: tested[m] for m in candidates}
-    return [m for m in candidates if tested[m] == "ok"], tested
+            results[futures[future]] = future.result()
+    working = sorted((m for m in candidates if results[m][0]),
+                     key=lambda m: (round(results[m][2] * 2) / 2, candidates.index(m)))
+    tested = {m: (f"ok ({results[m][2]:.1f} s)" if results[m][0] else results[m][1]) for m in candidates}
+    return working, tested
 
 
-BATCH_SIZE = 25
+BATCH_SIZE = 40   # sentences per request
 
 SYSTEM_PROMPT = """You are an expert on EU green-claims rules (Directive (EU) 2024/825, applying from 27 September 2026).
-You rate sentences from corporate sustainability reports.
+You rate numbered sentences from corporate sustainability reports. Answer fast and briefly, do not explain.
 
-For each sentence decide:
-1. is_claim: true if the company says or suggests something positive about its OWN environmental
-   impact, products, performance or plans. False for risk descriptions, regulation, general facts.
-2. category (only if is_claim is true), exactly one of:
-   - OFFSET_NEUTRALITY: product or company called climate/carbon neutral, compensated or climate positive based on offsets or credits.
-   - GENERIC: generic praise (green, eco-friendly, sustainable, climate-friendly, kind to the planet) without a figure or proof.
-   - OVERSTATED: absolute or whole-product claim (100% sustainable, zero impact, all our products ...).
-   - NEUTRALITY_UNSUPPORTED: present-tense neutrality claim without saying how it is achieved.
-   - FUTURE_NO_PLAN: future target without baseline, interim target, validation (e.g. SBTi), roadmap, budget or independent verification.
-   - FUTURE_WITH_PLAN: future target with at least one of those plan elements.
-   - SPECIFIC: measurable claim with a concrete figure and unit.
-   - VAGUE: commitment or aspiration without figures and without generic praise words.
-   - OTHER: environmental statement about the company that fits none of the above.
-   Check the categories in this order; the first that applies wins.
-3. reason: at most 15 words, quoting the decisive phrase.
+A sentence is a CLAIM if the company says or suggests something positive about its OWN environmental
+impact, products, performance or plans. Risk descriptions, regulation and general facts are not claims.
 
-Answer ONLY with a JSON array: [{"id": <int>, "is_claim": <bool>, "category": "<CATEGORY or null>", "reason": "<text>"}]"""
+For every CLAIM pick the first category that applies, in this order:
+OFFSET_NEUTRALITY: called climate/carbon neutral, compensated or climate positive based on offsets or credits.
+GENERIC: generic praise (green, eco-friendly, sustainable, climate-friendly, kind to the planet) without a figure or proof.
+OVERSTATED: absolute or whole-product claim (100% sustainable, zero impact, all our products ...).
+NEUTRALITY_UNSUPPORTED: present-tense neutrality claim without saying how it is achieved.
+FUTURE_NO_PLAN: future target without baseline, interim target, validation (e.g. SBTi), roadmap, budget or verification.
+FUTURE_WITH_PLAN: future target with at least one of those plan elements.
+SPECIFIC: measurable claim with a concrete figure and unit.
+VAGUE: commitment or aspiration without figures and without generic praise words.
+OTHER: environmental statement about the company that fits none of the above.
+
+Answer ONLY with a JSON array that lists the CLAIMS (leave out every sentence that is not a claim):
+[{"id": <int>, "c": "<CATEGORY>", "r": "<decisive phrase, max 6 words>"}]
+If no sentence is a claim, answer []."""
 
 
 def _parse(text: str) -> list[dict]:
@@ -140,18 +154,27 @@ def _ask_anthropic(payload: str, api_key: str, model: str) -> str:
     return "".join(block.text for block in response.content if getattr(block, "type", "") == "text")
 
 
+NO_THINKING = {"chat_template_kwargs": {"thinking": False, "enable_thinking": False}}
+_no_thinking_refused: set[str] = set()   # models that reject the switch (HTTP 400)
+
+
+def _nvidia_body(model: str, messages: list[dict], max_tokens: int) -> dict:
+    body = {"model": model, "messages": messages, "temperature": 0, "max_tokens": max_tokens}
+    if model not in _no_thinking_refused:
+        body.update(NO_THINKING)          # reasoning models answer much faster without "thinking"
+    return body
+
+
 def _ask_nvidia(payload: str, api_key: str, model: str, retries: int = 4) -> str:
-    body = {
-        "model": model,
-        "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": payload}],
-        "temperature": 0,       # same input -> (almost) same answer
-        "max_tokens": 8000,     # reasoning models need room to think
-    }
+    messages = [{"role": "system", "content": "/no_think\n" + SYSTEM_PROMPT}, {"role": "user", "content": payload}]
     for attempt in range(retries + 1):
         try:
-            data = _nvidia_post(body, api_key, timeout=300)
+            data = _nvidia_post(_nvidia_body(model, messages, 3000), api_key, timeout=300)
             return data["choices"][0]["message"]["content"] or ""
         except urllib.error.HTTPError as err:
+            if err.code == 400 and model not in _no_thinking_refused:   # model does not know the switch
+                _no_thinking_refused.add(model)
+                continue
             if err.code == 429 and attempt < retries:   # rate limit: wait and try again
                 time.sleep(float(err.headers.get("Retry-After") or 15))
                 continue
@@ -194,17 +217,19 @@ def rate_sentences(sentences: list[str], api_key: str, model: str | None = None,
                     ratings[idx] = Rating(r.is_claim, r.category, r.evidence, source="rules-fallback")
                 items = []
             for item in items:
+                if not isinstance(item, dict):
+                    continue
                 try:
                     idx = start + int(item["id"])
                 except (KeyError, TypeError, ValueError):
                     continue
                 if not start <= idx < start + size:
                     continue
-                category = item.get("category") or "OTHER"
+                category = str(item.get("c") or item.get("category") or "OTHER").upper()
                 if category not in CATEGORIES:
                     category = "OTHER"
-                ratings[idx] = Rating(bool(item.get("is_claim")), category, [str(item.get("reason", ""))],
-                                      source=source)
+                reason = str(item.get("r") or item.get("reason") or "")
+                ratings[idx] = Rating(bool(item.get("is_claim", True)), category, [reason], source=source)
             done += 1
             if progress:
                 progress(done / len(starts))

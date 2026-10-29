@@ -56,16 +56,18 @@ def _screen_cache() -> dict:
 
 
 def run_screening(pdf_bytes: bytes, company: str, mode: str, api_key: str | None, model: str | None,
-                  progress=None) -> ReportResult:
+                  progress=None, ai_scope: str = "claims") -> ReportResult:
     """Screen once per (file, company, mode, model) and reuse the result.
 
     A plain dict instead of st.cache_data, because st.cache_data would replay the live progress bar."""
     cache = _screen_cache()
-    key = (hashlib.sha256(pdf_bytes).hexdigest(), company, mode, model if mode in ("ai", "nvidia") else None)
+    key = (hashlib.sha256(pdf_bytes).hexdigest(), company, mode, model if mode in ("ai", "nvidia") else None,
+           ai_scope if mode in ("ai", "nvidia") else None)
     if key not in cache:
         if len(cache) >= 50:
             cache.pop(next(iter(cache)))
-        cache[key] = screen(pdf_bytes, company, mode=mode, api_key=api_key, model=model, progress=progress)
+        cache[key] = screen(pdf_bytes, company, mode=mode, api_key=api_key, model=model, progress=progress,
+                            ai_scope=ai_scope)
     return cache[key]
 
 
@@ -227,7 +229,7 @@ with inputs:
     set_col.toggle("Add the 3 fictional demo reports", key="use_demo")
 
 with st.sidebar:
-    api_key, model = None, None
+    api_key, model, ai_scope = None, None, "claims"
     if mode == "ai":
         api_key = st.text_input("Anthropic API key", type="password", value=os.environ.get("ANTHROPIC_API_KEY", ""),
                                 help="Only kept in this browser session, never stored.")
@@ -240,9 +242,10 @@ with st.sidebar:
             with st.spinner("Testing which NVIDIA models your key can use (up to 90 s) …"):
                 options, tested = nvidia_models(api_key)
         if options:
-            model = st.selectbox("Model", options, index=0,
-                                 help="Only models that just answered a test request with your key.")
-            st.caption(f"{len(options)} working model(s) found.")
+            speed = {m: tested[m].removeprefix("ok ") for m in options}
+            model = st.selectbox("Model", options, index=0, format_func=lambda m: f"{m}  {speed[m]}",
+                                 help="Only models that just answered a test request with your key, fastest first.")
+            st.caption(f"{len(options)} working model(s) found, fastest first.")
         else:
             if api_key:
                 if any(r == "HTTP 401" for r in tested.values()):
@@ -256,7 +259,13 @@ with st.sidebar:
                                   help="Any chat model ID from build.nvidia.com/models")
         if tested:
             with st.expander("Model test details"):
-                st.write({m: ("✅ works" if r == "ok" else f"❌ {r}") for m, r in tested.items()})
+                st.write({m: (f"✅ {r}" if r.startswith("ok") else f"❌ {r}") for m, r in tested.items()})
+    if mode in ("ai", "nvidia"):
+        thorough = st.toggle("Thorough AI check", value=False,
+                             help="Off (fast): the AI rates the sentences the rules flag as claims – a second "
+                                  "opinion on every claim. On: the AI also reads every other sentence with an "
+                                  "environmental keyword and can find claims the rules missed (about 3x slower).")
+        ai_scope = "all" if thorough else "claims"
     st.caption("GreenProof rates claims against the EU green-claims rules applying from 27 Sep 2026 "
                "(Directive (EU) 2024/825) and checks GHG disclosure along GRI 305 / GRI 102. "
                "It flags greenwashing *risk*, it is not a legal opinion.")
@@ -296,7 +305,7 @@ with inputs:
                     bar.progress(min((i + fraction) / len(files), 1.0), text=text)
 
                 try:
-                    res = run_screening(data, company, run_mode, api_key, model, progress=show)
+                    res = run_screening(data, company, run_mode, api_key, model, progress=show, ai_scope=ai_scope)
                     if res.sentences == 0:
                         notes.append(f"{fname}: no readable text – is it a scanned PDF?")
                     screened.append(res)
