@@ -20,21 +20,38 @@ from .classify import CATEGORIES, Rating
 DEFAULT_MODEL = os.environ.get("GREENPROOF_MODEL", "claude-sonnet-5-5")
 NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
 NVIDIA_MODELS_URL = "https://integrate.api.nvidia.com/v1/models"
-# NVIDIA retires models regularly, so the app asks the live catalog and picks the first of these that still exists.
+# NVIDIA retires models regularly and its catalog also lists models an account cannot call.
+# So the app tests candidates with a tiny request and only offers models that answer.
 NVIDIA_PREFERRED = [
     "meta/llama-3.3-70b-instruct",
-    "deepseek-ai/deepseek-v4-flash",
     "openai/gpt-oss-120b",
+    "deepseek-ai/deepseek-v4-flash",
+    "qwen/qwen3-next-80b-a3b-instruct",
+    "meta/llama-4-maverick-17b-128e-instruct",
+    "mistralai/mistral-medium-3-instruct",
+    "moonshotai/kimi-k2-instruct",
     "nvidia/nemotron-3-super-120b-a12b",
-    "deepseek-ai/deepseek-v4-pro",
+    "openai/gpt-oss-20b",
+    "google/gemma-3-27b-it",
+    "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+    "meta/llama-3.1-8b-instruct",
 ]
 NVIDIA_DEFAULT_MODEL = os.environ.get("GREENPROOF_NVIDIA_MODEL", NVIDIA_PREFERRED[0])
 _NOT_CHAT = re.compile(r"embed|rerank|guard|safety|reward|vision|vlm|clip|parse|ocr|retriever|whisper|asr|tts|"
-                       r"speech|audio|image|video|diffusion|flux|sdxl|cosmos|detector|pii|nemoretriever|-vl\b", re.I)
+                       r"speech|audio|image|video|diffusion|flux|sdxl|cosmos|detector|pii|nemoretriever|-vl\b|"
+                       r"coder|code|math|fuyu|kosmos|deplot|paligemma|neva|translate", re.I)
+_CHAT_HINT = re.compile(r"instruct|chat|-it\b|nemotron|gpt-oss|deepseek|kimi|qwen3", re.I)
+
+
+def _nvidia_post(body: dict, api_key: str, timeout: int = 180) -> dict:
+    request = urllib.request.Request(NVIDIA_URL, data=json.dumps(body).encode(), method="POST", headers={
+        "Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "Accept": "application/json"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read())
 
 
 def nvidia_chat_models(api_key: str | None = None) -> list[str]:
-    """Live list of chat models in the NVIDIA catalog, preferred models first."""
+    """Chat models in the NVIDIA catalog, preferred models first (not yet tested)."""
     headers = {"Accept": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
@@ -44,6 +61,41 @@ def nvidia_chat_models(api_key: str | None = None) -> list[str]:
     chat = sorted({i for i in ids if not _NOT_CHAT.search(i)})
     preferred = [m for m in NVIDIA_PREFERRED if m in chat]
     return preferred + [m for m in chat if m not in preferred]
+
+
+def nvidia_model_works(api_key: str, model: str) -> tuple[bool, str]:
+    """Send a one-token request. Returns (works, short reason)."""
+    try:
+        _nvidia_post({"model": model, "messages": [{"role": "user", "content": "Say OK"}], "max_tokens": 5},
+                     api_key, timeout=20)
+        return True, "ok"
+    except urllib.error.HTTPError as err:
+        return False, f"HTTP {err.code}"
+    except Exception as err:  # timeout, cold start, network
+        return False, type(err).__name__
+
+
+def nvidia_working_models(api_key: str, want: int = 4, max_tests: int = 10) -> tuple[list[str], dict[str, str]]:
+    """Test catalog models (preferred first) until `want` of them answer. Returns (working, tested->reason)."""
+    try:
+        catalog = nvidia_chat_models(api_key)
+    except Exception:
+        catalog = []
+    candidates = [m for m in NVIDIA_PREFERRED if m in catalog or not catalog]
+    candidates += [m for m in catalog if m not in candidates and _CHAT_HINT.search(m)]
+    working, tested = [], {}
+    for model in candidates[:max_tests]:
+        ok, reason = nvidia_model_works(api_key, model)
+        tested[model] = reason
+        if ok:
+            working.append(model)
+            if len(working) >= want:
+                break
+        elif reason == "HTTP 401":  # bad key: no point testing more models
+            break
+    return working, tested
+
+
 BATCH_SIZE = 25
 
 SYSTEM_PROMPT = """You are an expert on EU green-claims rules (Directive (EU) 2024/825, applying from 27 September 2026).
@@ -90,27 +142,25 @@ def _ask_anthropic(payload: str, api_key: str, model: str) -> str:
 
 
 def _ask_nvidia(payload: str, api_key: str, model: str, retries: int = 4) -> str:
-    body = json.dumps({
+    body = {
         "model": model,
         "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": payload}],
-        "temperature": 0,          # same input -> (almost) same answer
+        "temperature": 0,       # same input -> (almost) same answer
         "max_tokens": 8000,     # reasoning models need room to think
-    }).encode()
-    request = urllib.request.Request(NVIDIA_URL, data=body, method="POST", headers={
-        "Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "Accept": "application/json"})
+    }
     for attempt in range(retries + 1):
         try:
-            with urllib.request.urlopen(request, timeout=180) as response:
-                data = json.loads(response.read())
+            data = _nvidia_post(body, api_key)
             return data["choices"][0]["message"]["content"] or ""
         except urllib.error.HTTPError as err:
             if err.code == 429 and attempt < retries:   # rate limit: wait and try again
                 time.sleep(float(err.headers.get("Retry-After") or 15))
                 continue
             detail = err.read().decode(errors="ignore")[:300]
-            hint = {401: "API key invalid", 402: "NVIDIA credits used up", 404: "model name not found",
+            hint = {401: "API key invalid", 402: "NVIDIA credits used up",
+                    404: "model not available for your account, pick another model",
                     410: "model retired by NVIDIA, pick another model"}.get(err.code, "")
-            raise RuntimeError(f"NVIDIA API error {err.code} {hint}: {detail}") from err
+            raise RuntimeError(f"NVIDIA API error {err.code} ({hint}): {detail}") from err
     raise RuntimeError("NVIDIA API: rate limit, try again in a minute")
 
 

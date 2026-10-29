@@ -87,7 +87,7 @@ def test_nvidia_mode_with_fake_api(monkeypatch):
 def test_nvidia_bad_key_gives_clear_error(monkeypatch):
     import pytest
     _fake_nvidia(monkeypatch, "[]", fail_first_with=401)
-    with pytest.raises(RuntimeError, match="401 API key invalid"):
+    with pytest.raises(RuntimeError, match=r"401 \(API key invalid\)"):
         llm.rate_sentences(["Our shoes are eco-friendly."], api_key="bad", provider="nvidia")
 
 
@@ -112,3 +112,20 @@ def test_company_from_filename():
     assert c("ASUS_Detailed_2025_EN.pdf") == "ASUS"
     assert c("GBEN_Apple_Environmental_Progress_Report_2025.pdf") == "Apple"
     assert c("Lumen_Devices_2025.pdf") == "Lumen Devices"
+
+
+def test_nvidia_working_models_skips_unavailable(monkeypatch):
+    monkeypatch.setattr(llm, "nvidia_chat_models", lambda key: ["meta/llama-3.3-70b-instruct", "openai/gpt-oss-120b",
+                                                                "01-ai/yi-large", "zeta/new-chat-instruct"])
+    works = {"openai/gpt-oss-120b", "zeta/new-chat-instruct"}
+    monkeypatch.setattr(llm, "nvidia_model_works", lambda key, m: (m in works, "ok" if m in works else "HTTP 404"))
+    working, tested = llm.nvidia_working_models("k")
+    assert working == ["openai/gpt-oss-120b", "zeta/new-chat-instruct"]
+    assert tested["meta/llama-3.3-70b-instruct"] == "HTTP 404" and "01-ai/yi-large" not in tested
+
+
+def test_nvidia_working_models_stops_on_bad_key(monkeypatch):
+    monkeypatch.setattr(llm, "nvidia_chat_models", lambda key: list(llm.NVIDIA_PREFERRED))
+    monkeypatch.setattr(llm, "nvidia_model_works", lambda key, m: (False, "HTTP 401"))
+    working, tested = llm.nvidia_working_models("bad")
+    assert working == [] and len(tested) == 1

@@ -27,9 +27,9 @@ QUADRANT_COLORS = {"Credible": "#2E7D32", "Careful claims, thin data": "#F9A825"
 st.set_page_config(page_title="GreenProof – Greenwashing Screener", page_icon="🌿", layout="wide")
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def nvidia_models(api_key: str | None) -> list[str]:
-    return llm.nvidia_chat_models(api_key)
+@st.cache_data(ttl=900, show_spinner=False)
+def nvidia_models(api_key: str) -> tuple[list[str], dict[str, str]]:
+    return llm.nvidia_working_models(api_key)
 
 
 @st.cache_data(show_spinner=False)
@@ -54,16 +54,26 @@ with st.sidebar:
     if mode == "nvidia":
         api_key = st.text_input("NVIDIA API key (nvapi-…)", type="password", value=os.environ.get("NVIDIA_API_KEY", ""),
                                 help="Create one at build.nvidia.com → API keys. Only kept in this browser session.")
-        try:
-            options = nvidia_models(api_key or None)
-        except Exception:  # catalog not reachable: let the user type a model ID
-            options = []
+        options, tested = [], {}
+        if api_key:
+            with st.spinner("Testing which NVIDIA models your key can use …"):
+                options, tested = nvidia_models(api_key)
         if options:
             model = st.selectbox("Model", options, index=0,
-                                 help="Live list from build.nvidia.com. Recommended models are at the top.")
+                                 help="Only models that just answered a test request with your key.")
+            st.caption(f"✅ {len(options)} working model(s) found.")
         else:
+            if api_key:
+                if any(r == "HTTP 401" for r in tested.values()):
+                    st.error("NVIDIA rejected the key (401). Create a new one at build.nvidia.com → API keys.")
+                else:
+                    st.warning("None of the tested models answered. Copy a model ID from build.nvidia.com/models "
+                               "(page 'Try API') and paste it below.")
             model = st.text_input("Model", value=llm.NVIDIA_DEFAULT_MODEL,
                                   help="Any chat model ID from build.nvidia.com/models")
+        if tested:
+            with st.expander("Model test details"):
+                st.write({m: ("✅ works" if r == "ok" else f"❌ {r}") for m, r in tested.items()})
         if not api_key:
             st.info("Enter an NVIDIA API key to use this mode.")
     st.divider()
