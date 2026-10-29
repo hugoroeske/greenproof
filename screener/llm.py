@@ -16,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import urllib.error
 import urllib.request
 
-from .classify import CATEGORIES, Rating
+from .classify import CATEGORIES, Rating, rate_sentence
 
 DEFAULT_MODEL = os.environ.get("GREENPROOF_MODEL", "claude-sonnet-5-5")
 NVIDIA_URL = "https://integrate.api.nvidia.com/v1/chat/completions"
@@ -171,16 +171,28 @@ def rate_sentences(sentences: list[str], api_key: str, model: str | None = None,
     ratings: list[Rating] = [Rating(False, source=source)] * len(sentences)
     starts = list(range(0, len(sentences), BATCH_SIZE))
 
-    def run(start: int) -> tuple[int, list[dict]]:
+    def run(start: int) -> tuple[int, list[dict] | None]:
         payload = "Rate these sentences:\n" + "\n".join(
             f"{i}: {s}" for i, s in enumerate(sentences[start:start + BATCH_SIZE]))
-        return start, _parse(ask(payload, api_key, model))
+        for _ in range(2):                      # one retry if the answer is not valid JSON
+            try:
+                return start, _parse(ask(payload, api_key, model))
+            except (ValueError, json.JSONDecodeError):
+                continue
+        return start, None                      # give up on this batch, rules take over below
 
-    done = 0
-    with ThreadPoolExecutor(max_workers=4) as pool:   # 4 batches at a time, well below the rate limits
+    done, failed = 0, 0
+    workers = 8 if provider == "nvidia" else 4  # requests run in parallel, well below the rate limits
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         for future in as_completed([pool.submit(run, st) for st in starts]):
             start, items = future.result()
             size = min(BATCH_SIZE, len(sentences) - start)
+            if items is None:
+                failed += 1
+                for idx in range(start, start + size):
+                    r = rate_sentence(sentences[idx])
+                    ratings[idx] = Rating(r.is_claim, r.category, r.evidence, source="rules-fallback")
+                items = []
             for item in items:
                 try:
                     idx = start + int(item["id"])
@@ -196,4 +208,6 @@ def rate_sentences(sentences: list[str], api_key: str, model: str | None = None,
             done += 1
             if progress:
                 progress(done / len(starts))
+    if failed == len(starts) and starts:
+        raise RuntimeError(f"The model {model} never answered in the expected JSON format – pick another model.")
     return ratings

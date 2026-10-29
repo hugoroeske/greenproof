@@ -138,3 +138,27 @@ def test_ai_mode_only_sends_environmental_sentences(monkeypatch):
     ratings = pipeline._rate(texts, "nvidia", "k", None, None)
     assert sent == ["We cut Scope 1 emissions by 20% versus 2019."]
     assert [r.is_claim for r in ratings] == [False, True, False]
+
+
+def test_ai_batch_with_broken_json_falls_back_to_rules(monkeypatch):
+    monkeypatch.setattr(llm, "_ask_nvidia", lambda payload, key, model: "Sorry, I cannot do that.")
+    with __import__("pytest").raises(RuntimeError, match="JSON"):
+        llm.rate_sentences(["Our shoes are eco-friendly."], api_key="k", provider="nvidia")
+    calls = {"n": 0}
+
+    def flaky(payload, key, model):
+        calls["n"] += 1
+        return "no json" if "eco-friendly" in payload else '[{"id": 0, "is_claim": true, "category": "SPECIFIC"}]'
+
+    monkeypatch.setattr(llm, "_ask_nvidia", flaky)
+    texts = ["Our shoes are eco-friendly."] + ["We cut emissions by 20% versus 2019."] * llm.BATCH_SIZE
+    ratings = llm.rate_sentences(texts, api_key="k", provider="nvidia")
+    assert ratings[0].source == "rules-fallback" and ratings[0].category == "GENERIC"
+    assert ratings[-1].source == "ai-nvidia"
+
+
+def test_progress_reaches_one(monkeypatch):
+    monkeypatch.setattr(llm, "_ask_nvidia", lambda payload, key, model: "[]")
+    seen = []
+    llm.rate_sentences(["We cut emissions."] * (llm.BATCH_SIZE * 3), api_key="k", provider="nvidia", progress=seen.append)
+    assert len(seen) == 3 and seen[-1] == 1.0

@@ -4,7 +4,9 @@ Start with:  streamlit run app.py
 """
 from __future__ import annotations
 
+import hashlib
 import os
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -48,9 +50,23 @@ def nvidia_models(api_key: str) -> tuple[list[str], dict[str, str]]:
     return llm.nvidia_working_models(api_key)
 
 
-@st.cache_data(show_spinner=False)
-def run_screening(pdf_bytes: bytes, company: str, mode: str, api_key: str | None, model: str | None) -> ReportResult:
-    return screen(pdf_bytes, company, mode=mode, api_key=api_key, model=model)
+@st.cache_resource
+def _screen_cache() -> dict:
+    return {}
+
+
+def run_screening(pdf_bytes: bytes, company: str, mode: str, api_key: str | None, model: str | None,
+                  progress=None) -> ReportResult:
+    """Screen once per (file, company, mode, model) and reuse the result.
+
+    A plain dict instead of st.cache_data, because st.cache_data would replay the live progress bar."""
+    cache = _screen_cache()
+    key = (hashlib.sha256(pdf_bytes).hexdigest(), company, mode, model if mode in ("ai", "nvidia") else None)
+    if key not in cache:
+        if len(cache) >= 50:
+            cache.pop(next(iter(cache)))
+        cache[key] = screen(pdf_bytes, company, mode=mode, api_key=api_key, model=model, progress=progress)
+    return cache[key]
 
 
 def active_theme(choice: str | None, device: str | None) -> str:
@@ -270,8 +286,17 @@ with inputs:
             bar = st.progress(0.0, text="Starting …")
             for i, ((fname, data), company) in enumerate(zip(files, names["company"])):
                 bar.progress(i / len(files), text=f"Screening {company} …")
+                started = time.time()
+
+                def show(fraction: float, i=i, company=company, started=started) -> None:
+                    text = f"Screening {company} … {fraction:.0%}"
+                    if run_mode in ("ai", "nvidia") and 0 < fraction < 1:
+                        left = (time.time() - started) / fraction * (1 - fraction)
+                        text += f" · about {max(1, round(left / 60))} min left"
+                    bar.progress(min((i + fraction) / len(files), 1.0), text=text)
+
                 try:
-                    res = run_screening(data, company, run_mode, api_key, model)
+                    res = run_screening(data, company, run_mode, api_key, model, progress=show)
                     if res.sentences == 0:
                         notes.append(f"{fname}: no readable text – is it a scanned PDF?")
                     screened.append(res)
